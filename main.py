@@ -120,7 +120,7 @@ def fetch_rss_news(keyword):
     return articles
 
 def generate_ai_briefing(articles_list):
-    """Gemini AI를 사용해 수집된 뉴스를 하나의 브리핑으로 정리"""
+    """Gemini AI 다각도 호출 시스템 (404 예외 완벽 방지)"""
     if not GEMINI_API_KEY:
         print("⚠️ GEMINI_API_KEY가 없어 기본 목록 형태로 발송합니다.")
         return None
@@ -143,16 +143,35 @@ def generate_ai_briefing(articles_list):
 4. 문맥이 매끄럽고 보고서처럼 인사이트를 줄 수 있도록 정리할 것.
 """
 
+    # v1 API 정식 엔드포인트 지정하여 Client 객체 생성
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=prompt,
+        client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options={'api_version': 'v1'}
         )
-        return response.text
     except Exception as e:
-        print(f"❌ Gemini AI 요약 생성 실패: {e}")
+        print(f"❌ Client 생성 실패: {e}")
         return None
+
+    # 시도할 모델 순서 (Flash 2.0 -> Flash 1.5 -> Pro 1.5)
+    target_models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
+
+    for model_name in target_models:
+        try:
+            print(f"🤖 [{model_name}] 모델로 AI 요약 생성 시도 중...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            if response and response.text:
+                print(f"✅ [{model_name}] 요약 생성 성공!")
+                return response.text
+        except Exception as e:
+            print(f"⚠️ [{model_name}] 호출 실패: {e}")
+            continue
+
+    print("❌ 모든 AI 모델 호출 실패. 기본 뉴스 목록으로 전환합니다.")
+    return None
 
 def main():
     print("🚀 실시간 뉴스 수집 및 AI 브리핑 로봇 실행...")
