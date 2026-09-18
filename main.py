@@ -1,199 +1,110 @@
 import os
-import sys
-import json
-import time
-import html
+import re
 import urllib.request
-import urllib.parse
-from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
-from google import genai
+import xml.etree.ElementTree as ET
+import google.generativeai as genai
 
-# 1. Secrets에서 설정값 불러오기
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# 1. 환경 변수 로드
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# 2. 감시할 키워드 목록
-KEYWORDS = [
-    "삼성전자", "AI", "반도체", "증권", "부동산",
-    "금리", "주식", "현대차", "SK하이닉스", "배터리"
-]
+# Gemini API 설정
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-SENT_LINKS_FILE = "sent_links.txt"
+def send_telegram_message(message):
+    """텔레그램 메시지 발송 함수"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ 텔레그램 토큰 또는 Chat ID가 설정되지 않았습니다.")
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    params = urllib.parse.urlencode({
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': False
+    }).encode('utf-8')
+    
+    try:
+        req = urllib.request.Request(url, data=params)
+        urllib.request.urlopen(req)
+    except Exception as e:
+        print(f"⚠️ 텔레그램 발송 실패: {e}")
+
+def summarize_with_gemini(text):
+    """Gemini AI를 사용한 뉴스 요약 함수"""
+    if not GEMINI_API_KEY:
+        return "Gemini API 키가 없어 요약을 생성할 수 없습니다."
+    
+    try:
+        # 지원 가능한 최신 Flash 모델 사용
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"다음 뉴스 내용을 바탕으로 핵심 내용을 2-3줄로 명확하게 요약해 주세요:\n\n{text}"
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"❌ Gemini AI 요약 생성 실패: {e}")
+        return "AI 요약 생성 중 오류가 발생했습니다."
 
 def load_sent_links():
-    if os.path.exists(SENT_LINKS_FILE):
-        with open(SENT_LINKS_FILE, "r", encoding="utf-8") as f:
+    """이미 발송한 링크 목록 불러오기"""
+    if os.path.exists("sent_links.txt"):
+        with open("sent_links.txt", "r", encoding="utf-8") as f:
             return set(line.strip() for line in f if line.strip())
     return set()
 
-def save_sent_links(sent_links):
-    with open(SENT_LINKS_FILE, "w", encoding="utf-8") as f:
-        for link in sent_links:
-            f.write(f"{link}\n")
-
-def send_telegram_msg(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ 텔레그램 설정값이 없습니다.")
-        return False
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    
-    data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-    
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return True
-    except Exception as e:
-        print(f"❌ 텔레그램 발송 오류: {e}")
-        return False
-
-def fetch_rss_news(keyword):
-    """최근 15분 이내 뉴스만 수집"""
-    encoded_keyword = urllib.parse.quote(keyword)
-    rss_url = f"https://news.google.com/rss/search?q={encoded_keyword}&hl=ko&gl=KR&ceid=KR:ko"
-    
-    req = urllib.request.Request(rss_url, headers={'User-Agent': 'Mozilla/5.0'})
-    articles = []
-    kst = timezone(timedelta(hours=9))
-    now_kst = datetime.now(kst)
-    
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            xml_data = response.read().decode('utf-8')
-            items = xml_data.split('<item>')
-            
-            for item in items[1:]:
-                pub_date_str = ""
-                if '<pubDate>' in item and '</pubDate>' in item:
-                    pub_date_str = item.split('<pubDate>')[1].split('</pubDate>')[0].strip()
-                
-                is_within_15_min = False
-                pub_formatted = ""
-                
-                if pub_date_str:
-                    try:
-                        dt = parsedate_to_datetime(pub_date_str).astimezone(kst)
-                        pub_formatted = dt.strftime("%H:%M")
-                        time_diff_seconds = (now_kst - dt).total_seconds()
-                        
-                        if 0 <= time_diff_seconds <= 900:  # 15분 이내
-                            is_within_15_min = True
-                    except Exception:
-                        pass
-                
-                if not is_within_15_min:
-                    continue
-
-                title = ""
-                if '<title>' in item and '</title>' in item:
-                    title = item.split('<title>')[1].split('</title>')[0]
-                    title = title.replace('<![CDATA[', '').replace(']]>', '').strip()
-                
-                link = ""
-                if '<link>' in item and '</link>' in item:
-                    link = item.split('<link>')[1].split('</link>')[0].strip()
-                
-                source = "언론사 미상"
-                if '<source' in item and '</source>' in item:
-                    source = item.split('>')[1].split('</source>')[0].strip()
-
-                if keyword in title and link:
-                    articles.append({
-                        'keyword': keyword,
-                        'title': title,
-                        'link': link,
-                        'source': source,
-                        'pub_time': pub_formatted
-                    })
-    except Exception as e:
-        print(f"❌ [{keyword}] 뉴스 수집 실패: {e}")
-        
-    return articles
-
-def generate_ai_briefing(articles_list):
-    """Gemini AI를 사용해 수집된 뉴스를 하나의 브리핑으로 정리"""
-    if not GEMINI_API_KEY:
-        print("⚠️ GEMINI_API_KEY가 없어 기본 목록 형태로 발송합니다.")
-        return None
-
-    # 기사 목록 텍스트 구성
-    news_text_block = ""
-    for idx, item in enumerate(articles_list, 1):
-        news_text_block += f"{idx}. [{item['keyword']}] {item['title']} ({item['source']}, {item['pub_time']})\n"
-
-    prompt = f"""
-다음은 방금 수집된 실시간 뉴스 목록입니다.
-이 뉴스들을 바탕으로 텔레그램으로 보낼 '실시간 AI 뉴스 브리핑'을 작성해 주세요.
-
-[뉴스 목록]
-{news_text_block}
-
-[작성 조건]
-1. HTML 태그(<b>, <i> 등)를 적절히 활용하여 읽기 쉽게 가독성을 높일 것.
-2. 상단에 🤖 <b>[AI 실시간 뉴스 브리핑]</b> 제목을 붙일 것.
-3. 주요 뉴스들을 핵심 주제별로 2~3문장 내외로 명확하게 요약 정리할 것.
-4. 문맥이 매끄럽고 보고서처럼 인사이트를 줄 수 있도록 정리할 것.
-"""
-
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        return response.text
-    except Exception as e:
-        print(f"❌ Gemini AI 요약 생성 실패: {e}")
-        return None
+def save_sent_link(link):
+    """발송한 링크 저장하기"""
+    with open("sent_links.txt", "a", encoding="utf-8") as f:
+        f.write(f"{link}\n")
 
 def main():
     print("🚀 실시간 뉴스 수집 및 AI 브리핑 로봇 실행...")
+    
     sent_links = load_sent_links()
-    collected_articles = []
     
-    # 10개 키워드 전체 탐색
-    for keyword in KEYWORDS:
-        articles = fetch_rss_news(keyword)
-        for article in articles:
-            if article['link'] not in sent_links:
-                collected_articles.append(article)
-
-    if not collected_articles:
-        print("ℹ️ 최근 15분 이내 신규 뉴스가 없습니다.")
-        return
-
-    # AI 브리핑 생성 시도
-    ai_briefing = generate_ai_briefing(collected_articles)
+    # 네이버 뉴스 RSS 예시 (필요시 키워드/RSS URL 변경 가능)
+    rss_url = "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko"
     
-    # 메시지 작성
-    if ai_briefing:
-        message = ai_briefing + "\n\n<b>📌 관련 기사 링크:</b>\n"
-        for item in collected_articles:
-            safe_title = html.escape(item['title'])
-            message += f"• <a href='{item['link']}'>{safe_title}</a>\n"
-    else:
-        # AI 요약 실패 시 기본 리스트 형태 메시지
-        message = "🚨 <b>[실시간 신규 뉴스 모음]</b>\n\n"
-        for item in collected_articles:
-            safe_title = html.escape(item['title'])
-            safe_kw = html.escape(item['keyword'])
-            message += f"<b>[{safe_kw}]</b> {safe_title}\n🔗 <a href='{item['link']}'>기사 보기</a>\n\n"
-
-    # 텔레그램으로 단 1개의 브리핑 메시지 전송
-    if send_telegram_msg(message):
-        for item in collected_articles:
-            sent_links.add(item['link'])
-        save_sent_links(sent_links)
-        print(f"🎉 총 {len(collected_articles)}건의 뉴스를 브리핑하여 발송 완료했습니다.")
+    try:
+        req = urllib.request.Request(rss_url, headers={'User-Agent': 'Mozilla/5.0'})
+        response = urllib.request.urlopen(req)
+        xml_data = response.read()
+        root = ET.fromstring(xml_data)
+        
+        items = root.findall('.//item')
+        count = 0
+        
+        for item in items[:5]:  # 상위 5개 기사 처리
+            title = item.find('title').text if item.find('title') is not None else "제목 없음"
+            link = item.find('link').text if item.find('link') is not None else ""
+            description = item.find('description').text if item.find('description') is not None else ""
+            
+            # HTML 태그 제거
+            clean_description = re.sub('<[^<]+?>', '', description)
+            
+            if link and link not in sent_links:
+                print(f"📰 새로운 뉴스 처리 중: {title}")
+                
+                # Gemini AI 요약 생성
+                summary = summarize_with_gemini(clean_description or title)
+                
+                # 텔레그램 메시지 구성
+                message = f"<b>[실시간 뉴스 브리핑]</b>\n\n" \
+                          f"📌 <b>{title}</b>\n\n" \
+                          f"🤖 <b>AI 요약:</b>\n{summary}\n\n" \
+                          f"🔗 <a href='{link}'>기사 원문 보기</a>"
+                
+                send_telegram_message(message)
+                save_sent_link(link)
+                count += 1
+                
+        print(f"🎉 총 {count}건의 뉴스를 브리핑하여 발송 완료했습니다.")
+        
+    except Exception as e:
+        print(f"❌ 뉴스 수집 중 오류 발생: {e}")
 
 if __name__ == "__main__":
     main()
